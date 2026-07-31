@@ -24,20 +24,17 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Pull new sets/figs from Rebrickable
-        working-directory: scripts
-        run: python fetch_rebrickable_bulk.py
+        run: python scripts/fetch_rebrickable_bulk.py
         env:
           REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
 
       - name: Resolve new figs to BrickLink IDs
-        working-directory: scripts
-        run: python update_fig_mapping.py
+        run: python scripts/update_fig_mapping.py
         env:
           REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
 
       - name: Refresh BrickLink price data
-        working-directory: scripts
-        run: python fetch_bricklink_prices.py
+        run: python scripts/fetch_bricklink_prices.py
         env:
           BRICKLINK_CONSUMER_KEY: ${{ secrets.BRICKLINK_CONSUMER_KEY }}
           BRICKLINK_CONSUMER_SECRET: ${{ secrets.BRICKLINK_CONSUMER_SECRET }}

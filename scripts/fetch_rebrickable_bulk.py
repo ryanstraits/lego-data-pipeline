@@ -1,8 +1,8 @@
 """
-Pulls Rebrickable's free bulk catalog CSVs (sets, minifigs, inventory_minifigs),
-filters down to the themes we care about (data/themes.csv), and diffs against
-what we already have in data/minifigs_by_set.csv to find NEW sets and NEW
-(rebrickable) fig numbers since last run.
+Pulls Rebrickable set/theme/minifig data via the official REST API, filters
+down to the themes we care about (data/themes.csv), and diffs against what
+we already have in data/sets_seen.csv to find NEW sets and NEW (rebrickable)
+fig numbers since last run.
 
 Output:
   data/_new_sets.csv           -- sets seen for the first time this run
@@ -11,53 +11,82 @@ Output:
   data/sets_seen.csv           -- running list of every set_num we've processed
                                    (state file, committed back to the repo)
 
-Rebrickable doesn't publish a permanently-fixed URL for these files, so we
-scrape the current link off the downloads page rather than hardcoding a URL
-that might go stale.
+Earlier versions of this script scraped Rebrickable's /downloads/ page for
+bulk CSV.gz dumps, but that page is now behind an active Cloudflare JS
+challenge that a plain HTTP client can't solve. The REST API used here
+(themes/sets list endpoints + per-set minifigs sub-resource) isn't behind
+that challenge and covers the same data at a similar request cost --
+~1 call for themes, ~28 paginated calls to list all sets, plus one call per
+newly-discovered set to fetch its minifigs.
 """
 
 import csv
-import gzip
-import io
-import re
+import os
+import time
 import requests
 
-DOWNLOADS_PAGE = "https://rebrickable.com/downloads/"
 DATA_DIR = "data"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+API_BASE = "https://rebrickable.com/api/v3/lego"
+REBRICKABLE_API_KEY = os.environ.get("REBRICKABLE_API_KEY", "")
+PAGE_SIZE = 1000
+SLEEP_INTERVAL = 0.4  # between per-set minifig lookups, to stay well under any rate limit
+MAX_RETRIES = 5
 
 
-def _find_download_url(filename):
-    resp = requests.get(DOWNLOADS_PAGE, timeout=30, headers=HEADERS)
-    resp.raise_for_status()
-    # Look for an href ending in e.g. ".../sets.csv.gz" (possibly with a
-    # query string / hash after it).
-    pattern = re.compile(
-        r'href=["\'](https?://[^"\']*' + re.escape(filename) + r'\.gz[^"\']*)["\']'
-    )
-    match = pattern.search(resp.text)
-    if not match:
-        raise RuntimeError(
-            f"Couldn't find a download link for {filename} on the Rebrickable "
-            f"downloads page. The page layout may have changed -- check "
-            f"{DOWNLOADS_PAGE} manually."
-        )
-    return match.group(1)
+def _headers():
+    if not REBRICKABLE_API_KEY:
+        raise EnvironmentError("REBRICKABLE_API_KEY is not set.")
+    return {"Authorization": f"key {REBRICKABLE_API_KEY}"}
 
 
-def _download_gz_csv(filename):
-    url = _find_download_url(filename)
-    print(f"  Downloading {filename} from {url}")
-    resp = requests.get(url, timeout=60, headers=HEADERS)
-    resp.raise_for_status()
-    with gzip.GzipFile(fileobj=io.BytesIO(resp.content)) as gz:
-        text = gz.read().decode("utf-8")
-    return list(csv.DictReader(io.StringIO(text)))
+def _get_with_retries(url, params):
+    for attempt in range(MAX_RETRIES):
+        resp = requests.get(url, headers=_headers(), params=params, timeout=30)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 5 * (attempt + 1)))
+            print(f"  [rate limited] waiting {wait}s before retrying...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp
+    raise RuntimeError(f"Repeated 429s from {url}, giving up after {MAX_RETRIES} retries.")
+
+
+def _paginated(url, params):
+    """Walk a DRF-style paginated endpoint, yielding each result row."""
+    params = dict(params, page_size=PAGE_SIZE)
+    while url:
+        resp = _get_with_retries(url, params)
+        data = resp.json()
+        for row in data["results"]:
+            yield row
+        url = data.get("next")
+        params = None  # 'next' already has the query string baked in
+
+
+def fetch_all_themes():
+    return list(_paginated(f"{API_BASE}/themes/", {}))
+
+
+def fetch_all_sets():
+    return list(_paginated(f"{API_BASE}/sets/", {}))
+
+
+def fetch_set_minifigs(set_num):
+    """
+    Rebrickable represents each minifig as its own "set" with a fig-NNNNNN
+    number, so this sub-resource's rows carry that number under the
+    "set_num" key -- not to be confused with the real set's set_num.
+    """
+    rows = list(_paginated(f"{API_BASE}/sets/{set_num}/minifigs/", {}))
+    return [
+        {
+            "set_num": set_num,
+            "rebrickable_fig_num": row["set_num"],
+            "quantity": row["quantity"],
+        }
+        for row in rows
+    ]
 
 
 def load_active_theme_names():
@@ -71,11 +100,11 @@ def load_active_theme_names():
 
 def build_theme_id_to_root_name(themes_rows):
     """
-    Rebrickable's themes are hierarchical (e.g. 'Star Wars Episode 4/5/6' has
-    a parent_id pointing to 'Star Wars'). A set's theme_id in sets.csv is
-    almost always a specific sub-theme, not the parent -- so to filter by
-    'Star Wars' we need to walk each theme up to its root and match on that
-    root's name, not match theme_id directly against our config.
+    Rebrickable's themes are hierarchical (e.g. 'Star Wars: Rebels' has a
+    parent_id pointing to 'Star Wars'). A set's theme_id is almost always a
+    specific sub-theme, not the parent -- so to filter by 'Star Wars' we need
+    to walk each theme up to its root and match on that root's name, not
+    match theme_id directly against our config.
     """
     by_id = {row["id"]: row for row in themes_rows}
 
@@ -83,7 +112,7 @@ def build_theme_id_to_root_name(themes_rows):
         row = by_id.get(theme_id)
         if row is None or _depth > 10:  # guard against unexpected cycles
             return None
-        parent_id = row.get("parent_id") or ""
+        parent_id = row.get("parent_id")
         if not parent_id:
             return row["name"]
         return root_name(parent_id, _depth + 1)
@@ -100,38 +129,27 @@ def load_sets_seen():
 
 
 def main():
-    print("Fetching Rebrickable bulk data...")
-    sets_rows = _download_gz_csv("sets")
-    rb_themes_rows = _download_gz_csv("themes")
-    inv_minifigs_rows = _download_gz_csv("inventory_minifigs")
-    inventories_rows = _download_gz_csv("inventories")
+    print("Fetching Rebrickable theme + set data via API...")
+    themes_rows = fetch_all_themes()
+    sets_rows = fetch_all_sets()
 
-    # inventory_minifigs links to inventories.csv (inventory_id -> set_num),
-    # not directly to set_num, so build that lookup first.
-    inv_to_set = {row["id"]: row["set_num"] for row in inventories_rows}
-
-    theme_id_to_root = build_theme_id_to_root_name(rb_themes_rows)
+    theme_id_to_root = build_theme_id_to_root_name(themes_rows)
     active_names = load_active_theme_names()
 
     theme_set_nums = {
         row["set_num"] for row in sets_rows
-        if (theme_id_to_root.get(row.get("theme_id", "")) or "").strip().lower() in active_names
+        if (theme_id_to_root.get(row.get("theme_id")) or "").strip().lower() in active_names
     }
 
     sets_seen_before = load_sets_seen()
     new_sets = theme_set_nums - sets_seen_before
     print(f"  {len(theme_set_nums)} sets match active themes; {len(new_sets)} are new this run")
 
-    # Find fig appearances in newly-seen sets
     new_fig_rows = []
-    for row in inv_minifigs_rows:
-        set_num = inv_to_set.get(row["inventory_id"])
-        if set_num in new_sets:
-            new_fig_rows.append({
-                "set_num": set_num,
-                "rebrickable_fig_num": row["fig_num"],
-                "quantity": row["quantity"],
-            })
+    for i, set_num in enumerate(sorted(new_sets), 1):
+        print(f"  [{i}/{len(new_sets)}] Fetching minifigs for {set_num}")
+        new_fig_rows.extend(fetch_set_minifigs(set_num))
+        time.sleep(SLEEP_INTERVAL)
 
     with open(f"{DATA_DIR}/_new_sets.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -144,7 +162,6 @@ def main():
         w.writeheader()
         w.writerows(new_fig_rows)
 
-    # Update the running state file
     all_seen = sets_seen_before | theme_set_nums
     with open(f"{DATA_DIR}/sets_seen.csv", "w", newline="") as f:
         w = csv.writer(f)
