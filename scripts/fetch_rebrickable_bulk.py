@@ -24,10 +24,16 @@ import requests
 
 DOWNLOADS_PAGE = "https://rebrickable.com/downloads/"
 DATA_DIR = "data"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 
 def _find_download_url(filename):
-    resp = requests.get(DOWNLOADS_PAGE, timeout=30)
+    resp = requests.get(DOWNLOADS_PAGE, timeout=30, headers=HEADERS)
     resp.raise_for_status()
     # Look for an href ending in e.g. ".../sets.csv.gz" (possibly with a
     # query string / hash after it).
@@ -47,7 +53,7 @@ def _find_download_url(filename):
 def _download_gz_csv(filename):
     url = _find_download_url(filename)
     print(f"  Downloading {filename} from {url}")
-    resp = requests.get(url, timeout=60)
+    resp = requests.get(url, timeout=60, headers=HEADERS)
     resp.raise_for_status()
     with gzip.GzipFile(fileobj=io.BytesIO(resp.content)) as gz:
         text = gz.read().decode("utf-8")
