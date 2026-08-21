@@ -7,6 +7,13 @@ then pulls BrickLink price guide data (avg/min/max, used condition) for
 every fig in that scope and writes data/prices.csv -- the file Power Query
 points at.
 
+Also keeps data/bricklink_minifig_catalog.csv (name/category/year/weight
+per fig) up to date. BrickLink has no bulk catalog-download API, only a
+per-item lookup, so this reuses the same scope and only fetches catalog
+entries for figs not already cached -- catalog metadata essentially never
+changes once set, unlike price, so there's no need to re-fetch it monthly
+for figs we've already seen.
+
 This is the piece that costs BrickLink API calls, so everything upstream
 (theme filtering, fig resolution) exists to keep this scope as small as
 the real requirement, not the whole ~17-18k fig catalog.
@@ -51,6 +58,14 @@ def load_existing_prices():
         return {}
 
 
+def load_existing_catalog():
+    try:
+        with open(f"{DATA_DIR}/bricklink_minifig_catalog.csv", newline="") as f:
+            return {row["ITEMID"]: row for row in csv.DictReader(f)}
+    except FileNotFoundError:
+        return {}
+
+
 def main():
     my_figs = load_my_figs()
     active_prefixes = load_active_prefixes()
@@ -64,6 +79,9 @@ def main():
     existing = load_existing_prices()
     results = dict(existing)  # keep last month's values for anything that fails this run
 
+    catalog = load_existing_catalog()
+    catalog_lookups_done = 0
+
     for i, fig_id in enumerate(scope, 1):
         price_data = client.get_price_guide("MINIFIG", fig_id, new_or_used="U", guide_type="stock")
         if price_data:
@@ -73,6 +91,24 @@ def main():
                 "min_price": price_data["min_price"],
                 "max_price": price_data["max_price"],
             }
+
+        # Catalog metadata (name/year/category/weight) rarely changes once
+        # set, so only look up figs we don't already have cached -- this is
+        # the same "only pay for genuinely new items" pattern as the price
+        # loop above, just with a cache that persists indefinitely instead
+        # of refreshing every run.
+        if fig_id not in catalog:
+            item_data = client.get_item("MINIFIG", fig_id)
+            if item_data:
+                catalog[fig_id] = {
+                    "ITEMID": fig_id,
+                    "ITEMNAME": item_data["name"],
+                    "CATEGORY": item_data["category_id"],
+                    "ITEMYEAR": item_data["year_released"],
+                    "ITEMWEIGHT": item_data["weight"],
+                }
+                catalog_lookups_done += 1
+
         if i % 100 == 0:
             print(f"  ...{i}/{len(scope)} priced ({client.calls_made} API calls made)")
 
@@ -82,8 +118,16 @@ def main():
         for fig_id in sorted(results):
             w.writerow(results[fig_id])
 
-    print(f"Done. {client.calls_made} BrickLink API calls made. "
-          f"data/prices.csv written with {len(results)} priced figs.")
+    with open(f"{DATA_DIR}/bricklink_minifig_catalog.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["ITEMID", "ITEMNAME", "CATEGORY", "ITEMYEAR", "ITEMWEIGHT"])
+        w.writeheader()
+        for fig_id in sorted(catalog):
+            w.writerow(catalog[fig_id])
+
+    print(f"Done. {client.calls_made} BrickLink API calls made "
+          f"({catalog_lookups_done} new catalog entries). "
+          f"data/prices.csv written with {len(results)} priced figs, "
+          f"data/bricklink_minifig_catalog.csv has {len(catalog)} entries.")
 
 
 if __name__ == "__main__":

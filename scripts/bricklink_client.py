@@ -110,6 +110,40 @@ class BrickLinkClient:
             "total_quantity": data.get("total_quantity"),
         }
 
+    def get_item(self, item_type, item_no):
+        """
+        Catalog metadata for a single item (name, category, release year,
+        weight) -- BrickLink has no bulk "download the whole catalog"
+        endpoint, only this per-item lookup, so catalog data has to be
+        built up the same way the price guide is: one call per item.
+        Returns None if the item has no catalog entry / call failed.
+        """
+        if self.calls_made >= DAILY_CALL_LIMIT - SAFETY_MARGIN:
+            raise RuntimeError(
+                f"Stopping before hitting BrickLink's daily call cap "
+                f"({self.calls_made} calls made this run)."
+            )
+
+        url = f"{BASE_URL}/items/{item_type}/{item_no}"
+        header = self._oauth_header("GET", url)
+        resp = requests.get(url, headers={"Authorization": header}, timeout=15)
+        self.calls_made += 1
+
+        if resp.status_code != 200:
+            print(f"  [warn] item lookup failed for {item_no} ({resp.status_code}): {resp.text[:200]}")
+            return None
+
+        data = resp.json().get("data")
+        if not data:
+            return None
+
+        return {
+            "name": data.get("name"),
+            "category_id": data.get("category_id"),
+            "year_released": data.get("year_released"),
+            "weight": data.get("weight"),
+        }
+
 
 def _require_env(name):
     val = os.environ.get(name)

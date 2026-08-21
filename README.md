@@ -10,6 +10,7 @@ track. Runs on GitHub Actions (free tier), no laptop needs to stay on.
 |---|---|---|
 | `data/prices.csv` | avg/min/max BrickLink price per fig in scope | every run |
 | `data/minifigs_by_set.csv` | set_num → BrickLink minifig_id → quantity | grows as new sets appear |
+| `data/bricklink_minifig_catalog.csv` | BrickLink ID → name/category/year/weight | grows as new figs enter scope |
 | `data/sets_seen.csv` | every set_num processed so far (state file) | grows |
 | `data/fig_bricklink_map.csv` | Rebrickable fig_num → BrickLink ID cache | grows |
 
