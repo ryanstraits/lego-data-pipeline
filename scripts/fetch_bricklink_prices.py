@@ -1,22 +1,25 @@
 """
 Builds the price-lookup scope = (your figs, data/my_figs.csv)
-                               + (every fig belonging to an active theme,
-                                  derived from data/minifigs_by_set.csv +
+                               + (every fig in data/bricklink_minifig_catalog.csv
+                                  whose ID prefix matches an active theme in
                                   data/themes.csv' bricklink_prefix column)
 then pulls BrickLink price guide data (avg/min/max, used condition) for
 every fig in that scope and writes data/prices.csv -- the file Power Query
 points at.
 
-Also keeps data/bricklink_minifig_catalog.csv (name/category/year/weight
-per fig) up to date. BrickLink has no bulk catalog-download API, only a
-per-item lookup, so this reuses the same scope and only fetches catalog
-entries for figs not already cached -- catalog metadata essentially never
-changes once set, unlike price, so there's no need to re-fetch it monthly
-for figs we've already seen.
+The catalog file is BrickLink's own catalog data (periodically re-exported
+from bricklink.com and handed over manually -- BrickLink's API has no bulk
+catalog-download endpoint, only per-item lookups, so this can't be kept
+current automatically). Scoping by catalog rather than by
+data/minifigs_by_set.csv (which only contains figs Rebrickable has already
+linked to a discovered set) means newly-released figs show up here as soon
+as the catalog export is refreshed, without waiting on Rebrickable to catch
+up. Any scope fig missing from the catalog (e.g. something added to
+my_figs.csv since the last export) still gets a live per-item lookup below.
 
 This is the piece that costs BrickLink API calls, so everything upstream
 (theme filtering, fig resolution) exists to keep this scope as small as
-the real requirement, not the whole ~17-18k fig catalog.
+the real requirement, not the whole ~19k fig catalog.
 """
 
 import csv
@@ -39,14 +42,12 @@ def load_active_prefixes():
         }
 
 
-def load_theme_scoped_figs(active_prefixes):
+def load_theme_scoped_figs(catalog, active_prefixes):
     figs = set()
-    with open(f"{DATA_DIR}/minifigs_by_set.csv", newline="") as f:
-        for row in csv.DictReader(f):
-            fig_id = row["bricklink_minifig_id"]
-            prefix = "".join(ch for ch in fig_id if ch.isalpha())
-            if prefix.lower() in active_prefixes:
-                figs.add(fig_id)
+    for fig_id in catalog:
+        prefix = "".join(ch for ch in fig_id if ch.isalpha())
+        if prefix.lower() in active_prefixes:
+            figs.add(fig_id)
     return figs
 
 
@@ -69,7 +70,8 @@ def load_existing_catalog():
 def main():
     my_figs = load_my_figs()
     active_prefixes = load_active_prefixes()
-    theme_figs = load_theme_scoped_figs(active_prefixes)
+    catalog = load_existing_catalog()
+    theme_figs = load_theme_scoped_figs(catalog, active_prefixes)
 
     scope = sorted(my_figs | theme_figs)
     print(f"Price scope: {len(my_figs)} of your figs + {len(theme_figs)} theme figs "
@@ -79,7 +81,6 @@ def main():
     existing = load_existing_prices()
     results = dict(existing)  # keep last month's values for anything that fails this run
 
-    catalog = load_existing_catalog()
     catalog_lookups_done = 0
 
     for i, fig_id in enumerate(scope, 1):
