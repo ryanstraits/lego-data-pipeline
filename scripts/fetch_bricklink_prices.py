@@ -73,18 +73,32 @@ def main():
     catalog = load_existing_catalog()
     theme_figs = load_theme_scoped_figs(catalog, active_prefixes)
 
-    scope = sorted(my_figs | theme_figs)
+    existing = load_existing_prices()
+    # Never-priced figs go first. If scope exceeds the daily call cap and
+    # the run stops early (see below), this guarantees genuinely new figs
+    # still get reached instead of silently starving forever behind
+    # whatever happens to sort earlier alphabetically -- already-priced
+    # figs just keep last month's value for one more cycle in that case.
+    scope = sorted(my_figs | theme_figs, key=lambda fig_id: (fig_id in existing, fig_id))
+    new_count = sum(1 for fig_id in scope if fig_id not in existing)
     print(f"Price scope: {len(my_figs)} of your figs + {len(theme_figs)} theme figs "
-          f"= {len(scope)} unique figs to price this run.")
+          f"= {len(scope)} unique figs to price this run ({new_count} never priced before).")
 
     client = BrickLinkClient()
-    existing = load_existing_prices()
     results = dict(existing)  # keep last month's values for anything that fails this run
 
     catalog_lookups_done = 0
+    stopped_early = False
 
     for i, fig_id in enumerate(scope, 1):
-        price_data = client.get_price_guide("MINIFIG", fig_id, new_or_used="U", guide_type="stock")
+        try:
+            price_data = client.get_price_guide("MINIFIG", fig_id, new_or_used="U", guide_type="stock")
+        except RuntimeError as e:
+            print(f"  [stopping] {e} -- {len(scope) - i + 1} figs left unpriced this run, "
+                  f"they'll be picked up next run.")
+            stopped_early = True
+            break
+
         if price_data:
             results[fig_id] = {
                 "bricklink_minifig_id": fig_id,
@@ -99,7 +113,12 @@ def main():
         # loop above, just with a cache that persists indefinitely instead
         # of refreshing every run.
         if fig_id not in catalog:
-            item_data = client.get_item("MINIFIG", fig_id)
+            try:
+                item_data = client.get_item("MINIFIG", fig_id)
+            except RuntimeError as e:
+                print(f"  [stopping] {e}")
+                stopped_early = True
+                break
             if item_data:
                 catalog[fig_id] = {
                     "ITEMID": fig_id,
@@ -125,7 +144,8 @@ def main():
         for fig_id in sorted(catalog):
             w.writerow(catalog[fig_id])
 
-    print(f"Done. {client.calls_made} BrickLink API calls made "
+    status = "Stopped early (daily call cap)" if stopped_early else "Done"
+    print(f"{status}. {client.calls_made} BrickLink API calls made "
           f"({catalog_lookups_done} new catalog entries). "
           f"data/prices.csv written with {len(results)} priced figs, "
           f"data/bricklink_minifig_catalog.csv has {len(catalog)} entries.")
